@@ -1,0 +1,391 @@
+/*
+  esp32_cam_robot.ino
+  - ESP32-CAM webserver with MJPEG stream and AsyncWebSocket teleop
+  - Differential DC motor control via H-bridge (PWM + IN pins)
+  - 4-DOF servo manipulator control
+  - Embedded web UI served by the ESP32
+
+  Libraries required (install via Library Manager or from GitHub):
+  - ESP32 board support (Espressif)
+  - ESP32Servo (https://github.com/jkb-git/ESP32Servo)
+  - AsyncTCP (https://github.com/me-no-dev/AsyncTCP)
+  - ESPAsyncWebServer (https://github.com/me-no-dev/ESPAsyncWebServer)
+  - ArduinoJson (https://arduinojson.org/)
+
+  Pin mappings and hardware notes are in BOM.md
+*/
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+
+// ====== USER CONFIG ======
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+const char* deviceName = "esp32-cam-robot"; // optional
+
+// ====== CAMERA CONFIG (AI-Thinker) ======
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM     0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM       5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ====== Motor pins (example) - adjust to your wiring ======
+const int LEFT_PWM_PIN = 12;  // LEDC channel 0
+const int LEFT_IN1_PIN = 14;
+const int LEFT_IN2_PIN = 27;
+
+const int RIGHT_PWM_PIN = 13; // LEDC channel 1
+const int RIGHT_IN1_PIN = 25;
+const int RIGHT_IN2_PIN = 26;
+
+// PWM channels/parameters
+const int LEFT_LEDC_CHANNEL = 0;
+const int RIGHT_LEDC_CHANNEL = 1;
+const int LEDC_FREQ = 20000;
+const int LEDC_RESOLUTION = 8; // 8-bit PWM (0..255)
+
+// ====== Servo pins ======
+const int SERVO_PINS[4] = {2, 15, 4, 16}; // servo0..servo3
+
+// ====== Globals ======
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+Servo servos[4];
+
+// helper for last known state
+int servoAngles[4] = {90, 90, 90, 90}; // default mid positions
+
+// forward declarations
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len);
+void onEvent(AsyncWebSocket *serverWS, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len);
+
+static String htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ESP32-CAM Robot Teleop</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 10px; }
+    #video { border: 1px solid #444; width: 640px; max-width: 100%; }
+    .controls { margin-top: 12px; }
+    button { padding:10px 16px; margin:4px; }
+    .slider { width: 300px; }
+    #status { margin-top: 8px; color:#006; }
+  </style>
+</head>
+<body>
+  <h3>ESP32-CAM Robot — Teleop</h3>
+  <img id="video" src="/stream" />
+  <div class="controls">
+    <div>
+      <button onclick="drive('forward')">Forward</button>
+      <button onclick="drive('left')">Left</button>
+      <button onclick="drive('stop')">Stop</button>
+      <button onclick="drive('right')">Right</button>
+      <button onclick="drive('backward')">Backward</button>
+    </div>
+
+    <div style="margin-top:10px;">
+      <label>Speed: <span id="speedVal">120</span></label>
+      <input id="speed" type="range" min="0" max="255" value="120" class="slider" oninput="speedChanged()" />
+    </div>
+
+    <h4>Manipulator (4-DOF)</h4>
+    <div id="servoControls"></div>
+
+    <div id="status">Connecting...</div>
+  </div>
+
+<script>
+let ws;
+function init() {
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.onopen = () => { document.getElementById('status').innerText = 'WebSocket connected'; };
+  ws.onclose = () => { document.getElementById('status').innerText = 'WebSocket disconnected'; setTimeout(init, 1500); };
+  ws.onmessage = (evt) => {
+    // currently no special incoming messages handled
+    console.log('WS message', evt.data);
+  };
+
+  // create servo sliders
+  const container = document.getElementById('servoControls');
+  for (let i = 0; i < 4; ++i) {
+    const div = document.createElement('div');
+    div.innerHTML = '<label>Servo ' + i + ' <span id="srv' + i + 'val">90</span>°</label>' +
+             '<input id="srv' + i + '" type="range" min="0" max="180" value="90" class="slider" ' +
+             'oninput="servoChanged(' + i + ')"/>';
+    container.appendChild(div);
+  }
+}
+
+function sendJSON(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function drive(cmd) {
+  const speed = parseInt(document.getElementById('speed').value);
+  let left=0, right=0;
+  if (cmd === 'forward') { left = speed; right = speed; }
+  else if (cmd === 'backward') { left = -speed; right = -speed; }
+  else if (cmd === 'left') { left = -Math.floor(speed*0.5); right = Math.floor(speed*0.5); }
+  else if (cmd === 'right') { left = Math.floor(speed*0.5); right = -Math.floor(speed*0.5); }
+  else if (cmd === 'stop') { left = 0; right = 0; }
+
+  sendJSON({ type: "drive", left: left, right: right });
+}
+
+function speedChanged() {
+  document.getElementById('speedVal').innerText = document.getElementById('speed').value;
+}
+
+function servoChanged(i) {
+  const val = parseInt(document.getElementById('srv' + i).value);
+  document.getElementById('srv' + i + 'val').innerText = val;
+  sendJSON({ type: "servo", id: i, angle: val });
+}
+
+window.onload = init;
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ========== Camera stream helper ==========
+// Based on the official ESP32-CAM example mjpeg_stream
+// This will stream multipart/x-mixed-replace frames from /stream
+#include <WebServer.h> // used only for streaming handler (we use AsyncWebServer to serve UI)
+WebServer streamServer(81); // separate server used to stream frames
+
+void startCameraServer(); // forward
+
+// streaming handler uses the lower level server (streamServer)
+void handleStream() {
+  WiFiClient client = streamServer.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  streamServer.sendContent(response);
+
+  while (client.connected()) {
+    camera_fb_t * fb = NULL;
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      delay(10);
+      continue;
+    }
+    String header = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + String(fb->len) + "\r\n\r\n";
+    streamServer.sendContent(header);
+    streamServer.client().write(fb->buf, fb->len);
+    streamServer.sendContent("\r\n");
+    esp_camera_fb_return(fb);
+    // frame interval
+    delay(50); // ~20 fps upper bound; tune for performance
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("ESP32-CAM Robot starting...");
+
+  // Camera init
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_VGA; // VGA (640x480) - change if needed
+  config.jpeg_quality = 10;
+  config.fb_count = 2;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    while (true) { delay(1000); }
+  } else {
+    Serial.println("Camera initialized");
+  }
+
+  // Attach servos
+  for (int i = 0; i < 4; ++i) {
+    servos[i].attach(SERVO_PINS[i]);
+    servos[i].write(servoAngles[i]);
+  }
+
+  // Motor pins
+  pinMode(LEFT_IN1_PIN, OUTPUT);
+  pinMode(LEFT_IN2_PIN, OUTPUT);
+  pinMode(RIGHT_IN1_PIN, OUTPUT);
+  pinMode(RIGHT_IN2_PIN, OUTPUT);
+
+  // Setup LEDC PWM channels
+  ledcSetup(LEFT_LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+  ledcSetup(RIGHT_LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+  ledcAttachPin(LEFT_PWM_PIN, LEFT_LEDC_CHANNEL);
+  ledcAttachPin(RIGHT_PWM_PIN, RIGHT_LEDC_CHANNEL);
+  ledcWrite(LEFT_LEDC_CHANNEL, 0);
+  ledcWrite(RIGHT_LEDC_CHANNEL, 0);
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed. Proceeding in AP mode.");
+    WiFi.softAP("ESP32-CAM-AP");
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
+  // Async WebSocket
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+
+  // root page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", htmlPage);
+  });
+
+  // Note: the /stream path is served by the separate streamServer on port 81
+  // Start servers
+  server.begin();
+  Serial.println("AsyncWebServer started on port 80");
+
+  streamServer.on("/stream", HTTP_GET, handleStream);
+  streamServer.begin(81);
+  Serial.println("Stream server started on port 81 (use /stream)");
+}
+
+// ====== WebSocket events & logic ======
+void setMotorPWM(int leftVal, int rightVal) {
+  // leftVal and rightVal range -255..255
+  auto apply = [](int in1, int in2, int ch, int value){
+    if (value == 0) {
+      digitalWrite(in1, LOW);
+      digitalWrite(in2, LOW);
+      ledcWrite(ch, 0);
+      return;
+    }
+    if (value > 0) {
+      digitalWrite(in1, HIGH);
+      digitalWrite(in2, LOW);
+      ledcWrite(ch, value);
+    } else {
+      digitalWrite(in1, LOW);
+      digitalWrite(in2, HIGH);
+      ledcWrite(ch, -value);
+    }
+  };
+  value = leftVal; // just to avoid shadow warnings
+  apply(LEFT_IN1_PIN, LEFT_IN2_PIN, LEFT_LEDC_CHANNEL, leftVal);
+  apply(RIGHT_IN1_PIN, RIGHT_IN2_PIN, RIGHT_LEDC_CHANNEL, rightVal);
+}
+
+void applyServoCommand(int id, int angle) {
+  if (id < 0 || id > 3) return;
+  angle = constrain(angle, 0, 180);
+  servos[id].write(angle);
+  servoAngles[id] = angle;
+}
+
+void onEvent(AsyncWebSocket *serverWS, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("WS client connected: %u\n", client->id());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("WS client disconnected: %u\n", client->id());
+  } else if (type == WS_EVT_DATA) {
+    handleWebSocketMessage(arg, data, len);
+  }
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+  // data is not null-terminated; create a String
+  DynamicJsonDocument doc(256);
+  DeserializationError err = deserializeJson(doc, data, len);
+  if (err) {
+    Serial.println("WS: JSON parse error");
+    return;
+  }
+  const char* type = doc["type"];
+  if (!type) return;
+
+  if (strcmp(type, "drive") == 0) {
+    int left = doc["left"] | 0;
+    int right = doc["right"] | 0;
+    left = constrain(left, -255, 255);
+    right = constrain(right, -255, 255);
+    // Apply PWM (we map range -255..255 to 0..255 PWM)
+    setMotorPWM(left, right);
+    // Echo status to all clients
+    DynamicJsonDocument resp(128);
+    resp["status"] = "drive";
+    resp["left"] = left;
+    resp["right"] = right;
+    String out; serializeJson(resp, out);
+    ws.textAll(out);
+  } else if (strcmp(type, "servo") == 0) {
+    int id = doc["id"] | 0;
+    int angle = doc["angle"] | 90;
+    applyServoCommand(id, angle);
+    DynamicJsonDocument resp(128);
+    resp["status"] = "servo";
+    resp["id"] = id;
+    resp["angle"] = angle;
+    String out; serializeJson(resp, out);
+    ws.textAll(out);
+  }
+}
+
+void loop() {
+  // keep the async server and stream server running
+  ws.cleanupClients();
+  // nothing else needed here; event-driven
+}
